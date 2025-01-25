@@ -1,0 +1,331 @@
+#!/bin/bash
+#
+# Script de gestion d'une PKI avec Easy-RSA
+#
+# Usage général :
+#   ./easypki.sh <nompki> [--utilisateur [<nomcert>]|--machine [<nomcert>]|--renouv <nomcert>|--revoque <nomcert>]
+#
+
+set -e
+
+# --- Validation du groupe vpnadmins et du compte ansible ---
+if ! getent group vpnadmins >/dev/null; then
+    echo "Le groupe vpnadmins n'existe pas. Création du groupe et ajout de l'utilisateur ansible..."
+    sudo groupadd vpnadmins
+    sudo usermod -aG vpnadmins ansible
+    echo "IMPORTANT : Veuillez fermer votre session et la rouvrir avant de déployer les changements sur le serveur."
+    exit 1
+fi
+
+if ! id -nG ansible | grep -qw vpnadmins; then
+    echo "L'utilisateur ansible n'est pas membre du groupe vpnadmins. Ajout de ansible au groupe vpnadmins..."
+    sudo usermod -aG vpnadmins ansible
+    echo "IMPORTANT : Veuillez fermer votre session et la rouvrir avant de déployer les changements sur le serveur."
+    exit 1
+fi
+
+# Forcer le mode non interactif d'Easy-RSA
+export EASYRSA_BATCH=1
+export EASYRSA_ALGO=ec
+export EASYRSA_CURVE=secp384r1
+
+# Chemin vers l'exécutable Easy-RSA
+EASYRSA="/usr/share/easy-rsa/easyrsa"
+
+# Vérification du premier argument (nom de la PKI)
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <nompki> [--utilisateur [<nomcert>]|--machine [<nomcert>]|--renouv <nomcert>|--revoque <nomcert>]"
+  exit 1
+fi
+
+PKI_NAME="$1"
+ROYAUME=Projet_KBR
+shift
+
+# Dossier de gestion de la PKI
+PKI_DIR="/etc/openvpn/${PKI_NAME}"
+
+# Noms des CA subordonnées et de la CA principale renommée (copie)
+SUB_CA_UTIL="CA-utilisateur-${PKI_NAME}"
+SUB_CA_MACH="CA-machine-${PKI_NAME}"
+ROOT_CA="CA-${PKI_NAME}"
+
+# --- Fonction de nettoyage des certificats révoqués expirés ---
+cleanup_revoked() {
+  local index_file="${PKI_DIR}/pki/index.txt"
+  if [ -f "$index_file" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^R ]]; then
+        exp_date=$(echo "$line" | awk '{print $2}')
+        exp_epoch=$(date -d "${exp_date%Z}" +%s 2>/dev/null || true)
+        now_epoch=$(date +%s)
+        if [ -n "$exp_epoch" ] && [ "$now_epoch" -gt "$exp_epoch" ]; then
+          cn=$(echo "$line" | grep -o '/CN=[^/]*' | cut -d '=' -f2)
+          if [ -n "$cn" ]; then
+            cert_file="${PKI_DIR}/pki/issued/${cn}.crt"
+            if [ -f "$cert_file" ]; then
+              rm -f "$cert_file"
+              echo "Nettoyage : Certificat révoqué '$cn' supprimé (expiration dépassée)."
+            fi
+          fi
+        fi
+      fi
+    done < "$index_file"
+  fi
+}
+
+# --- Fonction d'affichage d'un certificat (CA ou autre) ---
+show_cert_info() {
+  local cert_path="$1"
+  if [ -f "$cert_path" ]; then
+    openssl x509 -in "$cert_path" -noout -subject -issuer -enddate
+  fi
+}
+
+# --- Fonction générique de listing par CA subordonné ---
+list_certificates_by_subca() {
+  local subca="$1"
+  echo "Certificat du CA subordonné ${subca#CA-} :"
+  show_cert_info "${PKI_DIR}/pki/issued/${subca}.crt"
+  echo "------------------------------"
+  echo "Certificats signés par ${subca#CA-} :"
+  for cert in "${PKI_DIR}/pki/issued/"*.crt; do
+    certname=$(basename "$cert" .crt)
+    # Exclure les certificats des CA subordonnées elles-mêmes
+    if [[ "$certname" == "$SUB_CA_UTIL" || "$certname" == "$SUB_CA_MACH" ]]; then
+      continue
+    fi
+    issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null)
+    if echo "$issuer" | grep -q "CN *= *${subca}"; then
+      exp=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+      echo "  $certname - Expiration : $exp"
+    fi
+  done
+}
+
+# Fonctions de listing spécifiques
+list_utilisateur_certificates() {
+  list_certificates_by_subca "$SUB_CA_UTIL"
+}
+
+list_machine_certificates() {
+  list_certificates_by_subca "$SUB_CA_MACH"
+}
+
+# --- Création de la PKI ou affichage de ses propriétés ---
+if [ $# -eq 0 ]; then
+  if [ ! -d "${PKI_DIR}" ]; then
+    echo "Création de la PKI '${PKI_NAME}'..."
+    mkdir -p "${PKI_DIR}"
+    pushd "${PKI_DIR}" > /dev/null
+
+    # Initialisation et création de la CA principale (la CA principale reste dans ca.crt)
+    $EASYRSA init-pki
+    $EASYRSA build-ca nopass
+
+    # Conserver ca.crt pour Easy-RSA et créer une copie renommée pour distribution
+    cp "pki/ca.crt" "pki/${ROOT_CA}.crt"
+
+    # Création des CA subordonnées pour utilisateur et machine
+    echo "Création du CA subordonné utilisateur..."
+    $EASYRSA gen-req "$SUB_CA_UTIL" nopass
+    $EASYRSA sign-req ca "$SUB_CA_UTIL"
+
+    echo "Création du CA subordonné machine..."
+    $EASYRSA gen-req "$SUB_CA_MACH" nopass
+    $EASYRSA sign-req ca "$SUB_CA_MACH"
+
+    popd > /dev/null
+    echo "PKI '${PKI_NAME}' créée avec la CA principale et les CA subordonnées."
+  else
+    echo "PKI '${PKI_NAME}' existante."
+    # Optionnel : afficher un récapitulatif des CA
+    echo "Détails de la PKI :"
+    if [ -f "${PKI_DIR}/pki/ca.crt" ]; then
+      echo "CA Principale :"
+      show_cert_info "${PKI_DIR}/pki/ca.crt"
+      echo "------------------------------"
+    fi
+    echo "CA Utilisateur :"
+    show_cert_info "${PKI_DIR}/pki/issued/${SUB_CA_UTIL}.crt"
+    echo "------------------------------"
+    echo "CA Machine :"
+    show_cert_info "${PKI_DIR}/pki/issued/${SUB_CA_MACH}.crt"
+  fi
+  exit 0
+fi
+
+# Exécution du nettoyage des certificats expirés/révoqués (si la PKI existe)
+if [ -d "${PKI_DIR}" ]; then
+  cleanup_revoked
+fi
+
+# --- Traitement des actions ---
+action="$1"
+shift
+
+case "$action" in
+  --utilisateur)
+    if [ $# -eq 0 ]; then
+      echo "Liste des certificats utilisateur de la PKI '${PKI_NAME}':"
+      list_utilisateur_certificates
+    else
+      CERT_NAME="$1"
+      shift
+      echo "Création (ou remplacement) du certificat utilisateur '$CERT_NAME'..."
+      pushd "${PKI_DIR}" > /dev/null
+      rm -f "pki/issued/${CERT_NAME}.crt" "pki/private/${CERT_NAME}.key"
+      # Sauvegarde du CA principal
+      cp pki/ca.crt pki/ca.crt.main
+      cp pki/private/ca.key pki/private/ca.key.main
+      # Remplacement temporaire avec le CA subordonné utilisateur
+      cp pki/issued/"${SUB_CA_UTIL}.crt" pki/ca.crt
+      cp pki/private/"${SUB_CA_UTIL}.key" pki/private/ca.key
+      # Génération de la requête et signature par le sub CA
+      $EASYRSA gen-req "$CERT_NAME" nopass
+      $EASYRSA sign-req client "$CERT_NAME"
+      # Restauration du CA principal
+      mv pki/ca.crt.main pki/ca.crt
+      mv pki/private/ca.key.main pki/private/ca.key
+      popd > /dev/null
+      echo "Certificat utilisateur '$CERT_NAME' créé/remplacé."
+
+      # --- Création du fichier .ovpn pour le client ---
+      echo "Création du fichier client .ovpn..."
+      cat <<OVPN_EOF > "${PKI_DIR}/${CERT_NAME}.ovpn"
+client
+dev tun
+proto udp
+remote symba.chezlepro.ca 1194
+# remote symba.chezlepro.ca 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-GCM
+data-ciphers AES-256-GCM
+<ca>
+$(cat "${PKI_DIR}/pki/CA-utilisateur-easy-rsa.chain.crt")
+</ca>
+<cert>
+$(cat "${PKI_DIR}/pki/issued/${CERT_NAME}.crt")
+</cert>
+<key>
+$(cat "${PKI_DIR}/pki/private/${CERT_NAME}.key")
+</key>
+<tls-auth>
+-----BEGIN OpenVPN Static key V1-----
+8368080c4dfdfcb059bf20b608b45f3e
+c57b56ff986cd87cff9f310e24f4ff3c
+8747ec0b923faaac94d8c9d11b819534
+a2372cc9ff2161305987bdec63d520ed
+fdd40ce0df53b68e7374cb3c2e8622db
+b29831775426403005f765241eb48d32
+7fd7535d66d90d2aec12337c833e3753
+5a865a072a64609cdf37faefd1cff219
+0d8b547cf21a2dd318e7e640a4cf83f7
+021e1c887f10aa9c9aee9b7caefa6b46
+6237839042734d45660064502c626303
+d958bc639a3a55334181474b25336ce2
+f186db83d3a866c3f68c84cf37df4573
+9e0b685e4265a668bd2bce9d61172170
+79ccbfb209c84025b641cfd850065f5c
+27bd96b208060d62c510ddfb3ef821c1
+-----END OpenVPN Static key V1-----
+</tls-auth>
+key-direction 1
+OVPN_EOF
+      echo "Fichier .ovpn créé : ${PKI_DIR}/${CERT_NAME}.ovpn"
+    fi
+    ;;
+  --machine)
+    if [ $# -eq 0 ]; then
+      echo "Liste des certificats machine de la PKI '${PKI_NAME}':"
+      list_machine_certificates
+    else
+      CERT_NAME="$1"
+      shift
+      echo "Création (ou remplacement) du certificat machine '$CERT_NAME'..."
+      pushd "${PKI_DIR}" > /dev/null
+      rm -f "pki/issued/${CERT_NAME}.crt" "pki/private/${CERT_NAME}.key"
+      # Sauvegarde du CA principal
+      cp pki/ca.crt pki/ca.crt.main
+      cp pki/private/ca.key pki/private/ca.key.main
+      # Remplacement temporaire avec le CA subordonné machine
+      cp pki/issued/"${SUB_CA_MACH}.crt" pki/ca.crt
+      cp pki/private/"${SUB_CA_MACH}.key" pki/private/ca.key
+      # Génération de la requête et signature par le sub CA
+      $EASYRSA gen-req "$CERT_NAME" nopass
+      $EASYRSA sign-req server "$CERT_NAME"
+      # Restauration du CA principal
+      mv pki/ca.crt.main pki/ca.crt
+      mv pki/private/ca.key.main pki/private/ca.key
+      popd > /dev/null
+      echo "Certificat machine '$CERT_NAME' créé/remplacé."
+    fi
+    ;;
+  --renouv)
+    if [ $# -gt 0 ]; then
+      CERT_NAME="$1"
+      shift
+      echo "Renouvellement du certificat '$CERT_NAME'..."
+      pushd "${PKI_DIR}" > /dev/null
+      if [ ! -f "pki/issued/${CERT_NAME}.crt" ]; then
+        echo "Erreur : Le certificat '$CERT_NAME' n'existe pas."
+        popd > /dev/null
+        exit 1
+      fi
+      if grep -q "^R.*\/CN=${CERT_NAME}\b" pki/index.txt; then
+        echo "Erreur : Le certificat '$CERT_NAME' est révoqué et ne peut être renouvelé."
+        popd > /dev/null
+        exit 1
+      fi
+      if [[ "$CERT_NAME" == *.* ]]; then
+          TYPE="machine"
+      else
+          TYPE="utilisateur"
+      fi
+      if [ ! -f "pki/private/${CERT_NAME}.key" ]; then
+        echo "Erreur : La clé privée pour '$CERT_NAME' est introuvable, impossible de renouveler."
+        popd > /dev/null
+        exit 1
+      fi
+      mkdir -p pki/reqs
+      openssl req -new -key "pki/private/${CERT_NAME}.key" -out "pki/reqs/${CERT_NAME}.csr" -subj "/CN=${CERT_NAME}" >/dev/null 2>&1
+      if [ "$TYPE" == "machine" ]; then
+          $EASYRSA sign-req server "$CERT_NAME"
+      else
+          $EASYRSA sign-req client "$CERT_NAME"
+      fi
+      popd > /dev/null
+      echo "Certificat '$CERT_NAME' renouvelé."
+    else
+      echo "Erreur : Veuillez préciser le nom du certificat à renouveler après --renouv."
+      exit 1
+    fi
+    ;;
+  --revoque)
+    if [ $# -gt 0 ]; then
+      CERT_NAME="$1"
+      shift
+      echo "Révocation du certificat '$CERT_NAME'..."
+      pushd "${PKI_DIR}" > /dev/null
+      $EASYRSA revoke "$CERT_NAME"
+      $EASYRSA gen-crl
+      popd > /dev/null
+      echo "Certificat '$CERT_NAME' révoqué."
+    else
+      echo "Erreur : Veuillez préciser le nom du certificat à révoquer après --revoque."
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Option inconnue : $action"
+    exit 1
+    ;;
+esac
+
+# Ajustement aux permissions pour permettre au compte ansible d'avoir accès à la pki
+sudo chown -R root:vpnadmins ${PKI_DIR}/pki
+sudo chmod -R g+rx ${PKI_DIR}
