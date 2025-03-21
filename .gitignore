@@ -44,3 +44,7 @@ requirement/ignore_requirements.txt
 screenshots
 screencasts
 script/todo/todo_override.json
+
+# Ansible
+script/ansible/*.hosts
+
